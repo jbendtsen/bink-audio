@@ -234,7 +234,7 @@ static int counter = 0;
 
 int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
     BinkAudioTrack *tk = ctx->track;
-    if (ctx->segmentIndex < 0 || ctx->segmentIndex >= tk->nSegments) {
+    if (ctx->segmentIndex < 0 || ctx->segmentIndex >= tk->nSegments || ctx->segmentSize < 0) {
         return -1;
     }
 
@@ -262,8 +262,14 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
         ctx->segmentSize = getBitsLsb(32, &ctx->reader, tk->source);
         ctx->nFinishedSamples = getBitsLsb(32, &ctx->reader, tk->source);
 
-        if (ctx->segmentSize <= 0)
+        if (ctx->segmentSize <= 0 || ctx->nFinishedSamples <= 0 || ctx->segmentSize >= (1 << 28)) {
+            /* printf(
+                "Exiting %d: offset: %#x, segmentSize: %d, nFinishedSamples: %d\n",
+                ctx->segmentIndex, initialOffset, ctx->segmentSize, ctx->nFinishedSamples
+            ); */
+            ctx->segmentSize = -1;
             return -1;
+        }
 
         /* printf(
             "%d: offset: %#x, segmentSize: %d, nFinishedSamples: %d\n",
@@ -276,8 +282,8 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
     float root = (float)(2.0 / (sqrt((double)frameSize) * 32768.0));
 
     /* printf(
-        "segmentSize: %d, blockSize: %d, frameSize: %d, nSamples: %d, root: %g (%08x)\n",
-        ctx->segmentSize, blockSize, frameSize, nSamples, root, *(unsigned*)&root
+        "segmentSize: %d, blockSize: %d, frameSize: %d, nSamples: %d\n",
+        ctx->segmentSize, blockSize, frameSize, nSamples
     ); */
 
     float quantTable[28]; // can only be as large as g_wmaCriticalFreqs
@@ -336,6 +342,11 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
 			    q = quantTable[b++];
 	    }
     }
+
+    /* printf(
+        "%d %d: idx = %d, nSamples = %d, frameSize = %d, reader = %d, segmentSize = %d\n",
+        ctx->segmentIndex, ctx->frameNumber, idx, nSamples, frameSize, ctx->reader.total / 8, ctx->segmentSize
+    ); */
 
     alignBitReader(&ctx->reader, 32);
 
