@@ -10,13 +10,6 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-#define SWAP32(x) (\
-    (((x) >> 24) & 0xff) | \
-    (((x) >>  8) & 0xff00) | \
-    (((x) <<  8) & 0xff0000) | \
-    (((x) << 24) & 0xff000000) \
-)
-
 typedef unsigned char u8;
 typedef unsigned int u32;
 
@@ -36,6 +29,8 @@ AudioSource Audio_createMemorySource(void *buffer, int offset, int size) {
     source->state.type = SOURCE_MEMORY;
     source->state.sliceOffset = offset;
     source->state.sliceSize = size;
+    source->state.reader.scratch = calloc(4096, 1);
+    source->state.reader.scLen = 4096;
     source->buffer = buffer;
     return (AudioSource) {
         .handle = source
@@ -47,6 +42,8 @@ AudioSource Audio_createFileSource(int fd, int offset, int size) {
     source->state.type = SOURCE_FILE;
     source->state.sliceOffset = offset;
     source->state.sliceSize = size;
+    source->state.reader.scratch = calloc(4096, 1);
+    source->state.reader.scLen = 4096;
     source->fd = fd;
     return (AudioSource) {
         .handle = source
@@ -93,25 +90,33 @@ int AudioSource_read(AudioSource source, void *buf, int size) {
     return size;
 }
 
-static void seekBitReader(BinkBitReader *r, AudioSource source, int newOffset) {
-    int curOffset = ((SourceState*)source.handle)->position;
-    if (newOffset >= curOffset - r->scLen && newOffset < curOffset) {
-        r->pos = (newOffset - curOffset + r->scLen) * 8;
+static inline BinkBitReader *getReader(AudioSource source) {
+    return &((SourceState*)source.handle)->reader;
+}
+
+static void seekBitReader(AudioSource source, int newOffset) {
+    SourceState *s = (SourceState*)source.handle;
+    //printf("curOffset: %#x, newOffset: %#x, sliceSize: %#x, scLen: %#x\n", s->position, newOffset, s->sliceSize, s->reader.scLen);
+    if (newOffset >= s->position - s->reader.scLen && newOffset < s->position) {
+        s->reader.pos = (newOffset - s->position + s->reader.scLen) * 8;
     } else {
         AudioSource_seek(source, newOffset);
-        r->pos = 0;
+        s->reader.pos = 0;
     }
 }
 
-static u32 getBitsLsb(int size, BinkBitReader *r, AudioSource source) {
+static u32 getBitsLsb(AudioSource source, int size) {
     if (size <= 0 || size > 32)
         return 0;
 
+    BinkBitReader *r = &((SourceState*)source.handle)->reader;
     u32 value = 0;
     int remaining = size;
     while (remaining > 0) {
         if (r->pos == 0) {
-            AudioSource_read(source, r->scratch, r->scLen);
+            int res = AudioSource_read(source, r->scratch, r->scLen);
+            if (res > 0 && res < r->scLen)
+                r->scLen = res;
         }
         u8 c = ((u8*)r->scratch)[r->pos >> 3];
         int bits = MIN(remaining, 8 - (r->pos & 7));
@@ -124,15 +129,17 @@ static u32 getBitsLsb(int size, BinkBitReader *r, AudioSource source) {
     return value;
 }
 
-void alignBitReader(BinkBitReader *r, int bits) {
+void alignBitReader(AudioSource source, int bits) {
+    BinkBitReader *r = &((SourceState*)source.handle)->reader;
     int count = (bits - (r->pos % bits)) % bits;
     r->pos = (r->pos + count) % (r->scLen * 8);
     r->total += count;
 }
 
-float getFloat(BinkBitReader *r, AudioSource source) {
+float getFloat(AudioSource source) {
+    BinkBitReader *r = &((SourceState*)source.handle)->reader;
     int pos = r->pos;
-    unsigned data = getBitsLsb(29, r, source);
+    unsigned data = getBitsLsb(source, 29);
     if (data == 0)
         return 0.0f;
     unsigned sign = (data >> 28) & 1;
@@ -220,8 +227,6 @@ int Audio_initPlayback(BinkPlayback *ctx, BinkAudioTrack *track) {
     ctx->track = track;
     // +1 to provide space for irfft algorithm, +1 again to keep two buffers in memory for cross-fade window overlap
     ctx->scratch = calloc(1 << (track->frameSizeBits + 2), sizeof(float));
-    ctx->reader.scratch = calloc(4096, 1);
-    ctx->reader.scLen = 4096;
     ctx->sampleOffset = 0;
     ctx->segmentIndex = 0;
     ctx->frameNumber = 0;
@@ -245,28 +250,32 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
         int initialOffset = tk->segmentTable[ctx->segmentIndex];
         //int isKeySegment = initialOffset & 1;
         initialOffset &= ~1;
+
+        BinkBitReader *reader = getReader(tk->source);
+        /*
         int curOffset = ((SourceState*)tk->source.handle)->position;
-        /* printf(
+        printf(
             "%d / %d: curOffset: %d, newOffset: %d, scLen: %d, prevTotal: %d\n",
             ctx->segmentIndex, tk->nSegments, curOffset, initialOffset, ctx->reader.scLen, ctx->reader.total
-        ); */
+        );
+        */
+
         if (ctx->segmentIndex == 0) {
             AudioSource_seek(tk->source, initialOffset);
-            ctx->reader.pos = 0;
+            reader->pos = 0;
         } else {
-            seekBitReader(&ctx->reader, tk->source, initialOffset);
+            seekBitReader(tk->source, initialOffset);
         }
+        reader->total = 0;
 
-        ctx->reader.total = 0;
-
-        ctx->segmentSize = getBitsLsb(32, &ctx->reader, tk->source);
-        ctx->nFinishedSamples = getBitsLsb(32, &ctx->reader, tk->source);
+        ctx->segmentSize = getBitsLsb(tk->source, 32);
+        ctx->nFinishedSamples = getBitsLsb(tk->source, 32);
 
         if (ctx->segmentSize <= 0 || ctx->nFinishedSamples <= 0 || ctx->segmentSize >= (1 << 28)) {
-            /* printf(
-                "Exiting %d: offset: %#x, segmentSize: %d, nFinishedSamples: %d\n",
-                ctx->segmentIndex, initialOffset, ctx->segmentSize, ctx->nFinishedSamples
-            ); */
+            printf(
+                "Exiting %d: offset: %#x, segmentSize: %d, nFinishedSamples: %d, readerOffset: %x\n",
+                ctx->segmentIndex, initialOffset, ctx->segmentSize, ctx->nFinishedSamples, ((SourceState*)tk->source.handle)->position
+            );
             ctx->segmentSize = -1;
             return -1;
         }
@@ -288,12 +297,12 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
 
     float quantTable[28]; // can only be as large as g_wmaCriticalFreqs
 
-    float first  = getFloat(&ctx->reader, tk->source) * root;
-    float second = getFloat(&ctx->reader, tk->source) * root;
+    float first  = getFloat(tk->source) * root;
+    float second = getFloat(tk->source) * root;
 
     int pos = 0;
     for (int i = 0; i < tk->nBands - 1; i++) {
-        pos = getBitsLsb(8, &ctx->reader, tk->source);
+        pos = getBitsLsb(tk->source, 8);
         if (pos > 95)
             pos = 95;
         quantTable[i] = expf(pos * EXP_FACTOR) * root;
@@ -308,17 +317,17 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
     int b = 0;
     float q = quantTable[b];
 
-    while (idx < nSamples && idx < frameSize && ctx->reader.total < ctx->segmentSize * 8) {
-	    int isRepeat = getBitsLsb(1, &ctx->reader, tk->source);
+    while (idx < nSamples && idx < frameSize && getReader(tk->source)->total < ctx->segmentSize * 8) {
+	    int isRepeat = getBitsLsb(tk->source, 1);
 	    int run = 1;
 	    if (isRepeat) {
-		    int value = getBitsLsb(4, &ctx->reader, tk->source);
+		    int value = getBitsLsb(tk->source, 4);
 		    run = g_rleLengths[value];
 	    }
 
 	    int end = MIN(MIN(idx + run*8, frameSize), nSamples);
 
-	    int width = getBitsLsb(4, &ctx->reader, tk->source);
+	    int width = getBitsLsb(tk->source, 4);
 	    if (width > 0) {
 		    while (idx < end) {
 			    if (tk->bands[b] == idx && b < tk->nBands) {
@@ -326,10 +335,10 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
 				    b++;
 			    }
 
-			    int coeff = getBitsLsb(width, &ctx->reader, tk->source);
+			    int coeff = getBitsLsb(tk->source, width);
 			    float value = 0;
 			    if (coeff) {
-				    int isNegative = (idx & 1) ^ getBitsLsb(1, &ctx->reader, tk->source);
+				    int isNegative = (idx & 1) ^ getBitsLsb(tk->source, 1);
 				    value = q * (float)(isNegative ? -coeff : coeff);
 			    }
 			    buffer[idx++] = value;
@@ -348,7 +357,7 @@ int Audio_decodeNextFrame(BinkPlayback *ctx, float *buffer) {
         ctx->segmentIndex, ctx->frameNumber, idx, nSamples, frameSize, ctx->reader.total / 8, ctx->segmentSize
     ); */
 
-    alignBitReader(&ctx->reader, 32);
+    alignBitReader(tk->source, 32);
 
     if (idx < frameSize)
         memset(&buffer[idx], 0, (frameSize - idx) * sizeof(float));

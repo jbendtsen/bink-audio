@@ -4,10 +4,18 @@
 #define SOURCE_FILE   2
 
 typedef struct {
+    unsigned char *scratch;
+    long long int total;
+    int scLen;
+    int pos;
+} BinkBitReader;
+
+typedef struct {
     int type;
     int sliceOffset;
     int sliceSize;
     int position;
+    BinkBitReader reader;
 } SourceState;
 
 typedef struct {
@@ -37,16 +45,8 @@ typedef struct {
 } BinkAudioTrack;
 
 typedef struct {
-    unsigned char *scratch;
-    long long int total;
-    int scLen;
-    int pos;
-} BinkBitReader;
-
-typedef struct {
     BinkAudioTrack *track;
     float *scratch;
-    BinkBitReader reader;
     int sampleOffset;
     int nFinishedSamples;
     int segmentSize;
